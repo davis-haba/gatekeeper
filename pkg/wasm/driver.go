@@ -1,41 +1,50 @@
 package wasm
 
 import (
-	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
+	"path"
 	"strings"
+	"syscall"
 
+	wasmtime "github.com/bytecodealliance/wasmtime-go"
 	constraints2 "github.com/open-policy-agent/frameworks/constraint/pkg/apis/constraints"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/core/templates"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/types"
 	target2 "github.com/open-policy-agent/gatekeeper/pkg/target"
 	"github.com/open-policy-agent/opa/storage"
-	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/api"
-	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-//go:embed greet.wasm
-var greetWasm []byte
+var root = flag.String("wasm-root", "~", "the root directory to search for WASM, defaults to homedir")
 
 func NewDriver() *Driver {
+	runPython, err := bootStrapPython()
+	if err != nil {
+		panic(err)
+	}
 	return &Driver{
-		wasmModules: make(map[string]string),
+		pythonModules: make(map[string]string),
+		runPython:     runPython,
 	}
 }
 
 type Driver struct {
-	wasmModules map[string]string
+	pythonModules map[string]string
+	runPython     func(string, string, string) (string, error)
 }
 
 type WasmDecision struct {
-	Decision []byte
-	Name     string
+	Decision   string
+	Name       string
+	Constraint *unstructured.Unstructured
 }
 
 var _ drivers.Driver = &Driver{}
@@ -46,29 +55,29 @@ func (d *Driver) AddTemplate(ctx context.Context, ct *templates.ConstraintTempla
 		return nil
 	}
 
-	wasmCode := ct.Spec.Targets[0].Rego //Wasm
+	pythonCode := ct.Spec.Targets[0].Rego //Python
 
-	if wasmCode == "" {
+	if pythonCode == "" {
 		return nil
 	}
 	/// TODO: let's pretend this is just a string for now
-	/// TODO: mutax
-	d.wasmModules[ct.Name] = string(greetWasm) // wasmCode
+	/// TODO: mutex
+	d.pythonModules[ct.Name] = pythonCode
 	return nil
 }
 
 func (d *Driver) RemoveTemplate(ctx context.Context, ct *templates.ConstraintTemplate) error {
-	delete(d.wasmModules, ct.Name)
+	delete(d.pythonModules, ct.Name)
 
 	return nil
 }
 
 func (d *Driver) AddConstraint(ctx context.Context, constraint *unstructured.Unstructured) error {
-	wasmModuleName := strings.ToLower(constraint.GetKind())
+	pythonModuleName := strings.ToLower(constraint.GetKind())
 
-	_, found := d.wasmModules[wasmModuleName]
+	_, found := d.pythonModules[pythonModuleName]
 	if !found {
-		return fmt.Errorf("no wasmModuleName with name: %q", wasmModuleName)
+		return fmt.Errorf("no wasmModuleName with name: %q", pythonModuleName)
 	}
 
 	return nil
@@ -86,43 +95,100 @@ func (d *Driver) RemoveData(ctx context.Context, target string, path storage.Pat
 	return nil
 }
 
-func (d *Driver) Query(ctx context.Context, target string, constraints []*unstructured.Unstructured, review interface{}, opts ...drivers.QueryOpt) ([]*types.Result, *string, error) {
-
-	stdout := bytes.NewBuffer(nil)
-
-	c := wazero.NewRuntimeConfig().
-		WithFeatureBulkMemoryOperations(true).WithFeatureSignExtensionOps(true).WithFeatureNonTrappingFloatToIntConversion(true)
-	// not sure why we need this but got this error: memory.copy invalid as feature "bulk-memory-operations" is disabled
-	r := wazero.NewRuntimeWithConfig(ctx, c)
-	//r := wazero.NewRuntime(ctx)
-	defer r.Close(ctx)
-	// By default, I/O streams are discarded and there's no file system.
-	config := wazero.NewModuleConfig().WithStdout(stdout).WithStderr(os.Stderr)
-
-	_, err := r.NewModuleBuilder("env").
-		ExportFunction("log", logString).
-		Instantiate(ctx, r)
-	if err != nil {
-		return nil, nil, err
-	}
-	// TinyGo needs wasi to
-	// implement functions such as panic.
-	// Need to see if we absolutely need it later
-	if _, err = wasi_snapshot_preview1.Instantiate(ctx, r); err != nil {
-		return nil, nil, err
-	}
-
-	wasmModuleName := make(map[string]bool)
-	// only run the constraints with wasm modules
-	var params interface{}
-	for _, constraint := range constraints {
-		wasmModuleName[strings.ToLower(constraint.GetKind())] = true
-
-		params, _, err = unstructured.NestedFieldNoCopy(constraint.Object, "spec", "parameters")
+// bootStrapPython loads a python intepreter into a WASM VM, then returns a handle
+// that allows the user to execute the passed python code.
+func bootStrapPython() (func(string, string, string) (string, error), error) {
+	base := ""
+	if *root == "~" {
+		home, err := os.UserHomeDir()
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
+		base = home
+	} else {
+		base = *root
 	}
+	root := path.Join(base, "hackathon/gatekeeper/wasm/Python-3.11.0rc2-wasm32-wasi-16")
+	src := path.Join(root, "python.wasm")
+
+	wasm, err := os.ReadFile(src)
+	if err != nil {
+		return nil, err
+	}
+
+	engine := wasmtime.NewEngine()
+	module, err := wasmtime.NewModule(engine, wasm)
+	if err != nil {
+		return nil, err
+	}
+
+	linker := wasmtime.NewLinker(engine)
+	if err := linker.DefineWasi(); err != nil {
+		return nil, err
+	}
+
+	store := wasmtime.NewStore(engine)
+	instance, err := linker.Instantiate(store, module)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := linker.DefineInstance(store, "python", instance); err != nil {
+		return nil, err
+	}
+
+	return func(code, data, params string) (string, error) {
+		guestRead, _, err := os.Pipe()
+		if err != nil {
+			return "", err
+		}
+		defer guestRead.Close()
+
+		guestReadHandle := path.Join("/proc", fmt.Sprintf("%d", syscall.Getpid()), "fd", fmt.Sprintf("%d", guestRead.Fd()))
+
+		hostRead, guestWrite, err := os.Pipe()
+		if err != nil {
+			return "", err
+		}
+		defer hostRead.Close()
+		defer guestWrite.Close()
+
+		guestWriteHandle := path.Join("/proc", fmt.Sprintf("%d", syscall.Getpid()), "fd", fmt.Sprintf("%d", guestWrite.Fd()))
+
+		// wasmtime closes file handles when the destructor is called (via golang GC)... it's not clear whether replacing
+		// the wasiConfig is sufficient to trigger this condition, so this may be an FD leak.
+		wasiConfig := wasmtime.NewWasiConfig()
+		if err := wasiConfig.SetStdinFile(guestReadHandle); err != nil {
+			return "", err
+		}
+		if err := wasiConfig.SetStdoutFile(guestWriteHandle); err != nil {
+			return "", err
+		}
+		wasiConfig.InheritStderr()
+		wasiConfig.SetArgv([]string{`python`, `-c`, code, data, params})
+		wasiConfig.PreopenDir(root, "/")
+
+		store.SetWasi(wasiConfig)
+
+		python, err := linker.GetDefault(store, "python")
+		if err != nil {
+			return "", err
+		}
+
+		_, err = python.Call(store)
+		if err != nil {
+			return "", err
+		}
+
+		response, err := readToEnd(guestWrite, hostRead)
+		if err != nil {
+			return "", err
+		}
+		return response, nil
+	}, nil
+}
+
+func (d *Driver) Query(ctx context.Context, target string, constraints []*unstructured.Unstructured, review interface{}, opts ...drivers.QueryOpt) ([]*types.Result, *string, error) {
 
 	gkr := review.(*target2.GkReview)
 
@@ -130,43 +196,38 @@ func (d *Driver) Query(ctx context.Context, target string, constraints []*unstru
 		Object: make(map[string]interface{}),
 	}
 
-	err = obj.UnmarshalJSON(gkr.Object.Raw)
+	err := obj.UnmarshalJSON(gkr.Object.Raw)
 	if err != nil {
 		return nil, nil, err
 	}
-	///TODO: resource
-	// resource := map[string]interface{}{
-	// 	"resource": obj.Object,
-	// }
+
 	var allDecisions []*WasmDecision
-	for name := range wasmModuleName {
-		wasmModule, found := d.wasmModules[name]
+	for _, constraint := range constraints {
+		pythonModule, found := d.pythonModules[strings.ToLower(constraint.GetKind())]
 		if !found {
 			continue
 		}
 
-		fmt.Println("Running wasm module", name)
-		moduleBytes := []byte(wasmModule)
-		code, err := r.CompileModule(ctx, moduleBytes, wazero.NewCompileConfig())
+		paramsStruct, _, err := unstructured.NestedFieldNoCopy(constraint.Object, "spec", "parameters")
 		if err != nil {
 			return nil, nil, err
 		}
-		// pass in object as os.Args[1]
-		mod, err := r.InstantiateModule(ctx, code, config.WithArgs("gatekeeper", string(gkr.Object.Raw), fmt.Sprintf("%v", params))) //add parameter later
-		if err != nil {
-			return nil, nil, err
-		}
-		///TODO: change to eval later
-		modEval := mod.ExportedFunction("greet")
 
-		_, err = modEval.Call(ctx)
+		params, err := json.Marshal(paramsStruct)
 		if err != nil {
-			return nil, nil, fmt.Errorf("error running wasm module %s: %v", name, err)
+			return nil, nil, err
 		}
-		decision := stdout.Bytes()
+
+		// pass in object as os.Args[1]
+		results, err := d.runPython(pythonModule, string(gkr.Object.Raw), string(params))
+		if err != nil {
+			return nil, nil, err
+		}
+
 		wasmDecision := &WasmDecision{
-			Decision: decision,
-			Name:     name,
+			Decision:   results,
+			Name:       constraint.GetName(),
+			Constraint: constraint,
 		}
 
 		allDecisions = append(allDecisions, wasmDecision)
@@ -177,28 +238,62 @@ func (d *Driver) Query(ctx context.Context, target string, constraints []*unstru
 
 	results := make([]*types.Result, len(allDecisions))
 	for i, wasmDecision := range allDecisions {
+		enforcementAction, found, err := unstructured.NestedString(wasmDecision.Constraint.Object, "spec", "enforcementAction")
+		if err != nil {
+			return nil, nil, err
+		}
+		if !found {
+			enforcementAction = constraints2.EnforcementActionDeny
+		}
+
 		results[i] = &types.Result{
 			Metadata: map[string]interface{}{
 				"name": wasmDecision.Name,
 			},
-			Constraint:        constraints[0],
+			Constraint:        wasmDecision.Constraint,
 			Msg:               string(wasmDecision.Decision),
-			EnforcementAction: constraints2.EnforcementActionDeny,
+			EnforcementAction: enforcementAction,
 		}
 	}
 
 	return results, nil, nil
 }
 
-func logString(ctx context.Context, m api.Module, offset, byteCount uint32) {
-	buf, ok := m.Memory().Read(ctx, offset, byteCount)
-	if !ok {
-		panic("Memory.Read out of range")
-	}
-	fmt.Println(string(buf))
-}
-
 func (d *Driver) Dump(ctx context.Context) (string, error) {
 	//TODO implement me
 	panic("implement me")
+}
+
+func readToEnd(w io.Writer, b io.Reader) (string, error) {
+	data := make([]byte, 256)
+	var builder strings.Builder
+	extra := 0
+	for {
+		l, err := b.Read(data)
+		if err != nil {
+			return "", err
+		}
+		if l < 0 {
+			return "", errors.New("negative reader read")
+		}
+		builder.Write(data[:l])
+		if l < len(data) {
+			break
+		}
+		// add an extra byte in case we reached the exact end of the buffer
+		// otherwise the next read blocks indefinitely
+		if l == len(data) {
+			extra++
+			n, err := w.Write([]byte("+"))
+			if err != nil {
+				return "", err
+			}
+			if n != 1 {
+				return "", errors.New("could not write extra byte")
+			}
+		}
+	}
+	val := builder.String()
+
+	return val[:len(val)-extra], nil
 }

@@ -56,6 +56,7 @@ MANAGER_IMAGE_PATCH := "apiVersion: apps/v1\
 \n      - image: <your image file>\
 \n        name: manager\
 \n        args:\
+\n        - --wasm-root=/\
 \n        - --port=8443\
 \n        - --logtostderr\
 \n        - --emit-admission-events\
@@ -78,6 +79,7 @@ MANAGER_IMAGE_PATCH := "apiVersion: apps/v1\
 \n      - image: <your image file>\
 \n        name: manager\
 \n        args:\
+\n        - --wasm-root=/\
 \n        - --emit-audit-events\
 \n        - --operation=audit\
 \n        - --operation=status\

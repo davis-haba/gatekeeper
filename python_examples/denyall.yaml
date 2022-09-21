@@ -1,0 +1,13 @@
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: denyall
+spec:
+  crd:
+    spec:
+      names:
+        kind: DenyAll
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        print("i am the deny all constraint, I deny everything")
