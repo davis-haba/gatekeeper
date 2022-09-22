@@ -456,3 +456,6 @@ tilt: generate manifests tilt-prepare
 
 tilt-clean:
 	rm -rf .tiltbuild
+
+js-test: gator
+	./bin/gator test --filename=playground/js_examples

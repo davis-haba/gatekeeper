@@ -8,12 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
-	"path"
 	"strings"
-	"syscall"
 
-	wasmtime "github.com/bytecodealliance/wasmtime-go"
+	"github.com/dop251/goja"
 	constraints2 "github.com/open-policy-agent/frameworks/constraint/pkg/apis/constraints"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/core/templates"
@@ -26,19 +23,19 @@ import (
 var root = flag.String("wasm-root", "~", "the root directory to search for WASM, defaults to homedir")
 
 func NewDriver() *Driver {
-	runPython, err := bootStrapPython()
+	runJS, err := bootstrapJS()
 	if err != nil {
 		panic(err)
 	}
 	return &Driver{
-		pythonModules: make(map[string]string),
-		runPython:     runPython,
+		jsModules: make(map[string]string),
+		runJS:     runJS,
 	}
 }
 
 type Driver struct {
-	pythonModules map[string]string
-	runPython     func(string, string, string) (string, error)
+	jsModules map[string]string
+	runJS     func(string, string, string) (string, error)
 }
 
 type WasmDecision struct {
@@ -55,29 +52,29 @@ func (d *Driver) AddTemplate(ctx context.Context, ct *templates.ConstraintTempla
 		return nil
 	}
 
-	pythonCode := ct.Spec.Targets[0].Rego //Python
+	jsCode := ct.Spec.Targets[0].Rego //JS
 
-	if pythonCode == "" {
+	if jsCode == "" {
 		return nil
 	}
 	/// TODO: let's pretend this is just a string for now
 	/// TODO: mutex
-	d.pythonModules[ct.Name] = pythonCode
+	d.jsModules[ct.Name] = jsCode
 	return nil
 }
 
 func (d *Driver) RemoveTemplate(ctx context.Context, ct *templates.ConstraintTemplate) error {
-	delete(d.pythonModules, ct.Name)
+	delete(d.jsModules, ct.Name)
 
 	return nil
 }
 
 func (d *Driver) AddConstraint(ctx context.Context, constraint *unstructured.Unstructured) error {
-	pythonModuleName := strings.ToLower(constraint.GetKind())
+	jsModuleName := strings.ToLower(constraint.GetKind())
 
-	_, found := d.pythonModules[pythonModuleName]
+	_, found := d.jsModules[jsModuleName]
 	if !found {
-		return fmt.Errorf("no wasmModuleName with name: %q", pythonModuleName)
+		return fmt.Errorf("no wasmModuleName with name: %q", jsModuleName)
 	}
 
 	return nil
@@ -95,96 +92,24 @@ func (d *Driver) RemoveData(ctx context.Context, target string, path storage.Pat
 	return nil
 }
 
-// bootStrapPython loads a python intepreter into a WASM VM, then returns a handle
-// that allows the user to execute the passed python code.
-func bootStrapPython() (func(string, string, string) (string, error), error) {
-	base := ""
-	if *root == "~" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		base = home
-	} else {
-		base = *root
-	}
-	root := path.Join(base, "hackathon/gatekeeper/wasm/Python-3.11.0rc2-wasm32-wasi-16")
-	src := path.Join(root, "python.wasm")
-
-	wasm, err := os.ReadFile(src)
-	if err != nil {
-		return nil, err
-	}
-
-	engine := wasmtime.NewEngine()
-	module, err := wasmtime.NewModule(engine, wasm)
-	if err != nil {
-		return nil, err
-	}
-
-	linker := wasmtime.NewLinker(engine)
-	if err := linker.DefineWasi(); err != nil {
-		return nil, err
-	}
-
-	store := wasmtime.NewStore(engine)
-	instance, err := linker.Instantiate(store, module)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := linker.DefineInstance(store, "python", instance); err != nil {
-		return nil, err
-	}
+func bootstrapJS() (func(string, string, string) (string, error), error) {
+	vm := goja.New()
 
 	return func(code, data, params string) (string, error) {
-		guestRead, _, err := os.Pipe()
+		_, err := vm.RunString(code)
 		if err != nil {
-			return "", err
+			panic(fmt.Sprintf("error loading js code: %s", err))
 		}
-		defer guestRead.Close()
-
-		guestReadHandle := path.Join("/proc", fmt.Sprintf("%d", syscall.Getpid()), "fd", fmt.Sprintf("%d", guestRead.Fd()))
-
-		hostRead, guestWrite, err := os.Pipe()
+		policyFn, ok := goja.AssertFunction(vm.Get("policy"))
+		if !ok {
+			panic("policy func not found in js code")
+		}
+		res, err := policyFn(goja.Undefined(), vm.ToValue(data), vm.ToValue(params))
 		if err != nil {
-			return "", err
-		}
-		defer hostRead.Close()
-		defer guestWrite.Close()
-
-		guestWriteHandle := path.Join("/proc", fmt.Sprintf("%d", syscall.Getpid()), "fd", fmt.Sprintf("%d", guestWrite.Fd()))
-
-		// wasmtime closes file handles when the destructor is called (via golang GC)... it's not clear whether replacing
-		// the wasiConfig is sufficient to trigger this condition, so this may be an FD leak.
-		wasiConfig := wasmtime.NewWasiConfig()
-		if err := wasiConfig.SetStdinFile(guestReadHandle); err != nil {
-			return "", err
-		}
-		if err := wasiConfig.SetStdoutFile(guestWriteHandle); err != nil {
-			return "", err
-		}
-		wasiConfig.InheritStderr()
-		wasiConfig.SetArgv([]string{`python`, `-c`, code, data, params})
-		wasiConfig.PreopenDir(root, "/")
-
-		store.SetWasi(wasiConfig)
-
-		python, err := linker.GetDefault(store, "python")
-		if err != nil {
-			return "", err
+			panic(fmt.Sprintf("error running policyFn: %s", err))
 		}
 
-		_, err = python.Call(store)
-		if err != nil {
-			return "", err
-		}
-
-		response, err := readToEnd(guestWrite, hostRead)
-		if err != nil {
-			return "", err
-		}
-		return response, nil
+		return fmt.Sprintf("%s", res.ToString()), err
 	}, nil
 }
 
@@ -203,7 +128,7 @@ func (d *Driver) Query(ctx context.Context, target string, constraints []*unstru
 
 	var allDecisions []*WasmDecision
 	for _, constraint := range constraints {
-		pythonModule, found := d.pythonModules[strings.ToLower(constraint.GetKind())]
+		jsModule, found := d.jsModules[strings.ToLower(constraint.GetKind())]
 		if !found {
 			continue
 		}
@@ -219,7 +144,10 @@ func (d *Driver) Query(ctx context.Context, target string, constraints []*unstru
 		}
 
 		// pass in object as os.Args[1]
-		results, err := d.runPython(pythonModule, string(gkr.Object.Raw), string(params))
+		fmt.Printf("gkr: %s\n", gkr)
+		fmt.Printf("gkrobject: %s\n", gkr.Object)
+		fmt.Printf("gkrobjectraw: %s\n", gkr.Object.Raw)
+		results, err := d.runJS(jsModule, string(gkr.Object.Raw), string(params))
 		if err != nil {
 			return nil, nil, err
 		}

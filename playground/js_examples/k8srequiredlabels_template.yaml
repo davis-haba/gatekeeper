@@ -1,0 +1,52 @@
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        # Schema for the `parameters` field
+        openAPIV3Schema:
+          type: object
+          properties:
+            message:
+              type: string
+            labels:
+              type: array
+              items:
+                type: object
+                properties:
+                  key:
+                    type: string
+                  allowedRegex:
+                    type: string
+  targets:
+  - target: admission.k8s.gatekeeper.sh
+    rego: |
+      function policy(objStr, paramStr) {
+        var obj = JSON.parse(objStr)
+        var params = JSON.parse(paramStr)
+        var labels = obj["metadata"]["labels"]
+        var output = "no violations"
+      
+        params["labels"].forEach(function (label, idx) {
+          if (labels === null) {
+            output = label["key"] + " is missing from labels " + labels
+            return
+          }
+      
+          if ((label["key"] in labels)==false) {
+            output = label["key"] + " is missing from labels " + JSON.stringify(labels)
+            return
+          }
+      
+          var regexMatch = labels[label["key"]].search(label["allowedRegex"])
+          if (("allowedRegex" in label) && (regexMatch > 0)) {
+            output = "value " + labels[label["key"]] + "of label " + label["key"] + " does not match required regex " + label["allowedRegex"]
+          }
+        });
+        return output
+      }
